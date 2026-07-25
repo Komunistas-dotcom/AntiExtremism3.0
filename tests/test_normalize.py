@@ -173,6 +173,27 @@ class TestLegacyAddressForms(unittest.TestCase):
             "facebook:handle:navinyvilejki",
         )
 
+    def test_odnoklassniki_group_without_a_slash(self):
+        """В реестре встречается 'ok.ru/group63138604843193' без косой черты."""
+        self.assertEqual(
+            single("https://ok.ru/group63138604843193").key,
+            "ok:numeric_id:63138604843193",
+        )
+
+    def test_letter_inside_a_numeric_id_yields_both_readings(self):
+        """'53538910б99605' — букву читаем и как цифру, и как лишний символ."""
+        self.assertEqual(
+            keys("https://ok.ru/group/53538910б99605"),
+            {"ok:numeric_id:53538910699605", "ok:numeric_id:5353891099605"},
+        )
+
+    def test_genuine_auto_generated_username_stays_a_handle(self):
+        """'user58462303877320' — обычный ник TikTok, а не число."""
+        self.assertEqual(
+            single("https://tiktok.com/@user58462303877320").key,
+            "tiktok:handle:user58462303877320",
+        )
+
     def test_shortlink_is_kept_as_a_resource(self):
         """Домен сокращателя не признак, а конкретный короткий адрес — признак."""
         identifier = single("https://bit.ly/slovo-belarusov")

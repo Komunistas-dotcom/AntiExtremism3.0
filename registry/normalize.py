@@ -233,6 +233,44 @@ def _handle(platform: str, value: str, raw: str, notes: list[str]) -> Identifier
     return Identifier(platform, "handle", value.lower(), raw, tuple(notes))
 
 
+# Буквы, которыми в цифровом идентификаторе оказывается опечатка набора.
+_DIGIT_LOOKALIKES = {"б": "6", "о": "0", "О": "0", "з": "3", "З": "3", "І": "1", "l": "1"}
+
+
+def _numeric_or_handle(
+    platform: str, value: str, raw: str, notes: list[str]
+) -> list[Identifier]:
+    """Числовой идентификатор, устойчивый к опечаткам в цифрах.
+
+    В реестре встречается ``ok.ru/group/53538910б99605`` — кириллическая
+    буква посреди цифр. Однозначно восстановить исходное число нельзя,
+    поэтому в индекс идут оба правдоподобных прочтения: буква как похожая
+    цифра и буква как лишний символ.
+    """
+    if value.isdigit():
+        return [Identifier(platform, "numeric_id", value, raw, tuple(notes))]
+
+    digits = sum(character.isdigit() for character in value)
+    if digits < 4 or digits / len(value) <= 0.7:
+        return [_handle(platform, value, raw, notes)]
+
+    note = notes + [f"в цифровом идентификаторе {value!r} есть буквы"]
+    readings: list[str] = []
+    for candidate in (
+        "".join(_DIGIT_LOOKALIKES.get(ch, ch) for ch in value),
+        "".join(ch for ch in value if ch.isdigit()),
+    ):
+        if candidate.isdigit() and candidate not in readings:
+            readings.append(candidate)
+
+    if not readings:
+        return [_handle(platform, value, raw, notes)]
+    return [
+        Identifier(platform, "numeric_id", reading, raw, tuple(note))
+        for reading in readings
+    ]
+
+
 # Разделы платформ, которые не являются именем аккаунта.
 _RESERVED = {
     "telegram": {"s", "c", "joinchat", "addstickers", "share", "proxy", "socks"},
@@ -484,9 +522,11 @@ def _ok(host, seg, query, raw, notes) -> list[Identifier]:
     head = seg[0]
     low = head.lower()
     if low in {"group", "profile"} and len(seg) > 1:
-        value = seg[1]
-        kind = "numeric_id" if value.isdigit() else "handle"
-        return [Identifier("ok", kind, value.lower(), raw, tuple(notes))]
+        return _numeric_or_handle("ok", seg[1], raw, notes)
+    # Косую черту в реестре иногда пропускают: ``ok.ru/group63138604843193``.
+    glued = re.fullmatch(r"(group|profile)(\d.*)", low)
+    if glued:
+        return _numeric_or_handle("ok", glued.group(2), raw, notes)
     if low == "dk":
         # Старая форма: ok.ru/dk?st.cmd=altGroupMain&st.groupId=648198885
         params = parse_qs(query)
