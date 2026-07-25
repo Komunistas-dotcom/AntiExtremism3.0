@@ -47,6 +47,11 @@ def clean_raw_url(raw: str) -> str:
     text = text.replace("­", "").replace("​", "").replace("﻿", "")
     # Адрес обрывается на первом настоящем пробеле: всё после — уже текст.
     text = _INLINE_JUNK.split(text)[0]
+    # В реестре «;» и «,» разделяют «зеркала», а пробел после них ставят не
+    # всегда: без этого к имени аккаунта прилипает следующее слово
+    # («cbswarsaw;сообщество»).
+    for separator in (";", ","):
+        text = text.split(separator)[0]
     return text.strip(_TRAILING_JUNK)
 
 
@@ -193,6 +198,10 @@ def normalize_path_segment(segment: str) -> tuple[str, list[str]]:
     """Исправить омоглифы в одном сегменте пути, если это опечатка."""
     notes: list[str] = []
     decoded = unquote(segment)
+    # После раскрытия «%20» в адресе может оказаться пробел, а за ним —
+    # прилипший текст («strokabelarus%20и%203»). Имя аккаунта пробелов
+    # не содержит ни на одной площадке, поэтому обрываем адрес здесь.
+    decoded = re.split(r"[\s\xa0]", decoded)[0]
     fixed, changed = fix_segment(decoded)
     if changed:
         notes.append(f"адрес: исправлены омоглифы {decoded!r} -> {fixed!r}")

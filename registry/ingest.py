@@ -1,12 +1,16 @@
 """Приведение исходного файла реестра к HTML, независимо от его формата.
 
-Министерство информации публикует список в формате ``.doc``. Требовать от
-человека вручную конвертировать файл нельзя, поэтому конвертацию делает сам
-сборщик: ``.doc``/``.docx`` прогоняются через LibreOffice в режиме без окна,
-а дальше работает общий разборщик HTML-таблицы.
+Министерство информации публикует список в формате ``.doc`` (Word 97-2003).
+Требовать от человека вручную конвертировать файл нельзя, поэтому сборщик
+читает его сам:
 
-Форматы ``.html`` и ``.md`` (выгрузка из Joplin) поддерживаются напрямую —
-они уже содержат ту же самую таблицу.
+* ``.doc``  — разбирается напрямую (см. :mod:`registry.msdoc`);
+* ``.docx`` — разбирается напрямую (zip + XML стандартной библиотеки);
+* ``.html``, ``.md`` — уже содержат ту же таблицу;
+* ``.odt``, ``.rtf`` — через LibreOffice, если он установлен.
+
+Формат определяется по содержимому файла: с сайта нередко приходит файл с
+расширением ``.doc``, который на самом деле ``.docx``.
 """
 
 from __future__ import annotations
@@ -18,6 +22,8 @@ import tempfile
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
+
+from .msdoc import DocError, doc_to_html
 
 # LibreOffice в разных сборках называется по-разному.
 _SOFFICE_NAMES = ("soffice", "libreoffice")
@@ -192,6 +198,19 @@ def load_html(path: str | Path) -> str:
     if fmt == "docx":
         # Самый частый случай: файл разбирается напрямую, без LibreOffice.
         return docx_to_html(path)
+
+    if fmt == "doc":
+        # Двоичный Word 97-2003 разбирается напрямую; LibreOffice остаётся
+        # запасным путём на случай необычного строения файла.
+        try:
+            return doc_to_html(path)
+        except DocError as exc:
+            if find_soffice() is None:
+                raise IngestError(
+                    f"Не удалось прочитать {path.name}: {exc}\n"
+                    "Обходной путь: откройте файл в Word или LibreOffice "
+                    "и сохраните как .docx, затем повторите."
+                ) from exc
 
     if fmt == "doc" or suffix in _OFFICE_SUFFIXES:
         with tempfile.TemporaryDirectory(prefix="registry-ingest-") as tmp:
