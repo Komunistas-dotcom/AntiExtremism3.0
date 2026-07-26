@@ -12,7 +12,9 @@ https://my.telegram.org → API development tools. Передаётся чере
 Что делает программа:
 
 1. просит номер телефона и код, который придёт в Telegram;
-2. читает подписки, а затем — пересылки и ссылки в своих сообщениях;
+2. читает подписки, а затем — пересылки и ссылки в переписке,
+   включая присланное собеседниками: полученное из экстремистского канала
+   тоже хранится в вашей переписке;
 3. сверяет найденное с реестром и показывает отчёт;
 4. выходит из аккаунта, чтобы в разделе «Устройства» не осталось следа.
 
@@ -35,14 +37,16 @@ from .telegram import TELETHON_MISSING, TelegramCheckSettings, collect
 
 CONSENT = """\
 Программа сейчас войдёт в ваш аккаунт Telegram, чтобы проверить подписки,
-пересылки и ссылки в ваших сообщениях.
+пересылки и ссылки в вашей переписке — включая то, что прислали вам
+собеседники: полученное тоже хранится у вас.
 
 Важно понимать:
   • вход настоящий: понадобится номер, код и, если включён, облачный пароль;
   • переписка НЕ сохраняется на диск — сообщения проверяются в памяти;
   • по окончании программа выйдет из аккаунта и удалит сеанс;
   • Telegram может временно ограничить аккаунт за необычную нагрузку;
-    чтение идёт неспешно, чтобы этого избежать.
+    чтение идёт неспешно, а при первом же требовании долгой паузы
+    программа сама остановится, чтобы не рисковать аккаунтом.
 
 Продолжить? [да/нет]: """
 
@@ -58,7 +62,12 @@ async def run_check(snapshot: Path, settings: TelegramCheckSettings, phone: str 
     # Пустая строковая сессия = сессия живёт только в памяти,
     # на диск не попадает ничего.
     client = TelegramClient(
-        StringSession(), settings.api_id, settings.api_hash, device_model="Self-Audit"
+        StringSession(),
+        settings.api_id,
+        settings.api_hash,
+        device_model="Self-Audit",
+        # Короткие паузы Telethon переждёт сам; длинные обработает наш код.
+        flood_sleep_threshold=settings.max_flood_wait,
     )
 
     await client.connect()
@@ -114,9 +123,16 @@ def main(argv: list[str] | None = None) -> int:
         help="не читать сообщения вообще, взять только список подписок",
     )
     parser.add_argument(
-        "--all-messages",
+        "--own-messages-only",
         action="store_true",
-        help="читать не только свои сообщения, но и чужие в диалогах",
+        help="читать только свои сообщения (быстрее, но присланное вам "
+        "останется непроверенным)",
+    )
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="быстрый режим: искать только сообщения со ссылками. "
+        "Читается во много раз меньше, но пересылки без ссылки не видны",
     )
     parser.add_argument(
         "--limit",
@@ -164,7 +180,8 @@ def main(argv: list[str] | None = None) -> int:
         api_hash=args.api_hash,
         message_limit=args.limit,
         read_messages=not args.subscriptions_only,
-        own_messages_only=not args.all_messages,
+        own_messages_only=args.own_messages_only,
+        quick=args.quick,
         logout_when_done=not args.keep_session,
         progress=lambda text: print(text),
     )

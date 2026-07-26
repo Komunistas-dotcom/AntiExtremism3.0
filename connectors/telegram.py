@@ -50,6 +50,23 @@ PAUSE_BETWEEN_DIALOGS = 0.4
 # проверка не превращалась в многочасовое перелистывание всей переписки.
 DEFAULT_MESSAGE_LIMIT = 3000
 
+# Telegram сам просит подождать, когда темп чтения кажется ему высоким.
+# Короткую паузу пережидаем, а требование ждать долго означает, что аккаунт
+# уже на подозрении: тогда чтение прекращаем, чтобы не довести до блокировки.
+MAX_FLOOD_WAIT = 60
+
+
+def _flood_wait_seconds(error) -> int | None:
+    """Сколько Telegram просит подождать, если это требование паузы.
+
+    Определяется по имени класса, а не по импорту: модуль должен читаться
+    и без установленной Telethon.
+    """
+    if "FloodWait" not in type(error).__name__:
+        return None
+    seconds = getattr(error, "seconds", None)
+    return int(seconds) if isinstance(seconds, (int, float)) else 0
+
 
 def require_telethon():
     """Подключить Telethon, объяснив по-человечески, если её нет."""
@@ -173,10 +190,18 @@ def _hidden_urls(message) -> list[str]:
 
 
 def observations_from_message(message, where: str) -> list[Observation]:
-    """Наблюдения из одного сообщения: пересылка и ссылки."""
+    """Наблюдения из одного сообщения: пересылка и ссылки.
+
+    Проверяются сообщения обеих сторон. Материал, присланный собеседником,
+    хранится в переписке пользователя — то есть является следом, — но в
+    отчёте помечается как полученный, а не как отправленный им самим.
+    """
     observations: list[Observation] = []
     date = getattr(message, "date", None)
     occurred_at = date.date().isoformat() if date is not None else None
+
+    outgoing = bool(getattr(message, "out", False))
+    author = "отправлено вами" if outgoing else "получено"
 
     origin_id, origin_name = _forward_origin(message)
     if origin_id:
@@ -185,17 +210,18 @@ def observations_from_message(message, where: str) -> list[Observation]:
                 platform="telegram",
                 kind="numeric_id",
                 value=origin_id,
-                trace_type="repost",
-                source=f"Telegram: пересланное — «{where}»",
+                trace_type="repost" if outgoing else "repost_received",
+                source=f"Telegram: пересланное в «{where}» ({author})",
                 raw=origin_name or origin_id,
                 occurred_at=occurred_at,
             )
         )
 
     text = getattr(message, "message", None) or ""
+    trace_type = "link" if outgoing else "link_received"
     for url in list(find_urls(text)) + _hidden_urls(message):
         for observation in observe_url(
-            url, "link", f"Telegram: ссылки — «{where}»", occurred_at
+            url, trace_type, f"Telegram: ссылка в «{where}» ({author})", occurred_at
         ):
             observations.append(observation)
 
@@ -215,9 +241,13 @@ class TelegramCheckSettings:
     api_hash: str
     message_limit: int = DEFAULT_MESSAGE_LIMIT
     read_messages: bool = True
-    own_messages_only: bool = True
+    # По умолчанию читаются сообщения обеих сторон: присланное собеседником
+    # хранится в переписке пользователя и тоже является следом.
+    own_messages_only: bool = False
+    quick: bool = False
     logout_when_done: bool = True
     pause: float = PAUSE_BETWEEN_DIALOGS
+    max_flood_wait: int = MAX_FLOOD_WAIT
     progress: object = None
     errors: list[str] = field(default_factory=list)
 
@@ -243,16 +273,15 @@ async def _collect_messages(client, settings, seen, dialogs):
     # Каждый диалог читается ровно один раз — двойной проход удваивал бы
     # нагрузку на аккаунт без всякой пользы.
     #
-    # Свои сообщения: берём подряд, без отбора. Их немного (Telegram
-    # отсеивает чужие на своей стороне), а пересылки видны только так —
-    # серверного отбора по пересылкам не существует.
+    # По умолчанию читаются сообщения обеих сторон: материал, присланный
+    # собеседником, хранится в переписке пользователя и потому является
+    # следом. Серверного отбора по пересылкам не существует, поэтому здесь
+    # нужен сплошной проход по последним сообщениям диалога.
     #
-    # Все сообщения: сплошное чтение чужой переписки — это и долго, и
-    # именно та нагрузка, за которую ограничивают аккаунт. Поэтому берём
-    # серверный отбор по ссылкам. Пересылки при этом проверяются только
-    # свои, но чужая пересылка и не является следом пользователя.
+    # Быстрый режим берёт серверный отбор по ссылкам: читается во много раз
+    # меньше, но пересылки без ссылки при этом не видны.
     sender = "me" if settings.own_messages_only else None
-    message_filter = None if settings.own_messages_only else _url_filter()
+    message_filter = _url_filter() if settings.quick else None
 
     for number, dialog in enumerate(dialogs, 1):
         where = dialog.name or "без названия"
@@ -269,8 +298,30 @@ async def _collect_messages(client, settings, seen, dialogs):
                     if observation.key not in seen:
                         seen.add(observation.key)
                         yield observation
-        except Exception as exc:  # доступ к диалогу может быть закрыт
-            settings.errors.append(f"{where}: {type(exc).__name__}")
+        except Exception as exc:
+            wait = _flood_wait_seconds(exc)
+            if wait is None:
+                # Доступ к диалогу может быть закрыт — обычное дело.
+                settings.errors.append(f"{where}: {type(exc).__name__}")
+            elif wait <= settings.max_flood_wait:
+                _report(
+                    settings,
+                    f"Telegram просит подождать {wait} с — пауза, затем продолжим.",
+                )
+                await asyncio.sleep(wait)
+            else:
+                # Долгое ожидание означает, что мы уже выглядим подозрительно.
+                # Продолжать — значит рисковать блокировкой аккаунта.
+                settings.errors.append(
+                    f"{where}: Telegram потребовал ждать {wait} с — чтение остановлено"
+                )
+                _report(
+                    settings,
+                    "Telegram ограничил темп чтения. Проверка сообщений "
+                    "остановлена, чтобы не рисковать аккаунтом. "
+                    "Подписки при этом уже проверены.",
+                )
+                return
 
         await asyncio.sleep(settings.pause)
 

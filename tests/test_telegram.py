@@ -152,17 +152,19 @@ class TestCollecting(unittest.TestCase):
         self.assertNotIn("telegram:handle:other", keys)
         self.assertEqual(client.requests, [], "сообщения не должны запрашиваться")
 
-    def test_own_messages_only_by_default(self):
+    def test_all_messages_are_read_by_default(self):
+        """Присланное собеседником хранится в переписке пользователя,
+        поэтому проверяться должны сообщения обеих сторон."""
         client = FakeClient(self.dialogs, self.messages)
         drain(client, settings())
         senders = {request[3] for request in client.requests}
-        self.assertEqual(senders, {"me"})
-
-    def test_all_messages_mode_widens_the_search(self):
-        client = FakeClient(self.dialogs, self.messages)
-        drain(client, settings(own_messages_only=False))
-        senders = {request[3] for request in client.requests}
         self.assertEqual(senders, {None})
+
+    def test_own_messages_only_mode_narrows_the_search(self):
+        client = FakeClient(self.dialogs, self.messages)
+        drain(client, settings(own_messages_only=True))
+        senders = {request[3] for request in client.requests}
+        self.assertEqual(senders, {"me"})
 
     def test_each_dialog_is_read_exactly_once(self):
         """Повторный проход по тому же диалогу удваивал бы нагрузку на аккаунт
@@ -246,3 +248,89 @@ class TestEndToEnd(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReceivedMessages(unittest.TestCase):
+    """Материал, присланный собеседником, тоже хранится у пользователя."""
+
+    def test_forward_received_from_a_channel_is_found(self):
+        message = Message(
+            message="",
+            fwd_from=ForwardHeader(PeerChannel(1223603803), "Плохой канал"),
+            date=datetime(2026, 2, 2),
+            out=False,
+        )
+        observation = observations_from_message(message, "Иван")[0]
+        self.assertEqual(observation.key, "telegram:numeric_id:1223603803")
+        self.assertEqual(observation.trace_type, "repost_received")
+        self.assertIn("получено", observation.source)
+
+    def test_link_received_from_a_person_is_found(self):
+        message = Message(message="глянь https://t.me/badchannel", out=False)
+        observation = observations_from_message(message, "Иван")[0]
+        self.assertEqual(observation.key, "telegram:handle:badchannel")
+        self.assertEqual(observation.trace_type, "link_received")
+
+    def test_sent_and_received_are_told_apart(self):
+        """Переслать самому и получить — разные действия, и это должно быть видно."""
+        sent = observations_from_message(Message(message="https://t.me/x", out=True), "Ч")
+        got = observations_from_message(Message(message="https://t.me/x", out=False), "Ч")
+        self.assertEqual(sent[0].trace_type, "link")
+        self.assertEqual(got[0].trace_type, "link_received")
+        self.assertIn("отправлено вами", sent[0].source)
+        self.assertIn("получено", got[0].source)
+
+    def test_received_material_reaches_the_report(self):
+        engine = MatchEngine(build_index("Telegram-канал https://t.me/badchannel"))
+        client = FakeClient(
+            [Dialog(User(7, username="ivan"), "Иван")],
+            {7: [Message(message="глянь https://t.me/badchannel", out=False)]},
+        )
+        matches = engine.match_all(drain(client, settings()))
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].confidence, EXACT)
+        self.assertEqual(matches[0].observation.trace_type, "link_received")
+
+
+class FloodWaitError(Exception):
+    """Подделка требования паузы от Telegram."""
+
+    def __init__(self, seconds):
+        super().__init__(f"wait {seconds}")
+        self.seconds = seconds
+
+
+class FloodingClient(FakeClient):
+    def __init__(self, dialogs, seconds):
+        super().__init__(dialogs, {})
+        self._seconds = seconds
+
+    async def iter_messages(self, entity, limit=None, filter=None, from_user=None):
+        self.requests.append((entity.id, limit, filter is not None, from_user))
+        raise FloodWaitError(self._seconds)
+        yield  # pragma: no cover
+
+
+class TestFloodProtection(unittest.TestCase):
+    """Требование Telegram подождать — это предупреждение, а не ошибка."""
+
+    def setUp(self):
+        self.dialogs = [
+            Dialog(Channel(11, "Первый", username="one"), "Первый"),
+            Dialog(Channel(22, "Второй", username="two"), "Второй"),
+        ]
+
+    def test_short_pause_is_waited_out_and_work_continues(self):
+        client = FloodingClient(self.dialogs, seconds=1)
+        current = settings(pause=0, max_flood_wait=5)
+        drain(client, current)
+        self.assertEqual(len(client.requests), 2, "оба диалога должны быть опрошены")
+
+    def test_long_pause_stops_reading_to_protect_the_account(self):
+        client = FloodingClient(self.dialogs, seconds=3600)
+        current = settings(pause=0, max_flood_wait=60)
+        observations = drain(client, current)
+        self.assertEqual(len(client.requests), 1, "чтение должно прекратиться сразу")
+        self.assertTrue(any("остановлено" in e for e in current.errors))
+        # Подписки собраны до чтения сообщений и должны остаться в результате.
+        self.assertTrue(any(o.trace_type == "subscription" for o in observations))
